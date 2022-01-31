@@ -11,9 +11,12 @@
 #include <map>
 #include <thread>
 #include <atomic>
+#include <queue>
 
 #include <cerrno>
 #include <cassert>
+
+#include <boost/lockfree/stack.hpp>
 
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
@@ -66,7 +69,11 @@ inline auto transfer_max()
 	return f;
 }
 
-enum { TOTAL_THREADS = 2 }; // for simultaneous read/write from a device handle and a socket
+/*
+ * For simultaneous read/write from a device handle and a socket.
+ * Each transfer direction has write queue.
+ */
+enum { TOTAL_THREADS = 4 };
 
 auto& get_threads()
 {
@@ -155,16 +162,24 @@ private:
 
 	bool m_client{};
 
+	boost::lockfree::stack<buffer_ptr> m_free_buffers{TOTAL_THREADS};
+	std::queue<buffer_ptr> m_write_queue[2]; // use m_write_queue_strand to serialize access
+
 	using seqnums_type = std::map<seqnum_t, seqnum_t>;
 	seqnums_type m_client_req_in; // seqnum of cmd_submit -> seqnum of cmd_unlink, DIR_IN client requests with payload
 
 	boost::asio::io_context::strand m_strand{io_context()};
+
+	// indexed by bool
+	boost::asio::io_context::strand m_write_queue_strand[2] { boost::asio::io_context::strand(ioctx()), 
+								  boost::asio::io_context::strand(ioctx()) };
+
 	boost::asio::windows::stream_handle m_dev;
 	tcp::socket m_sock;
 
 	static auto &get_hdr(buffer_ptr buf) noexcept { return *reinterpret_cast<usbip_header*>(buf->data()); }
 
-	auto& ioctx() noexcept { return m_strand.context(); }
+	boost::asio::io_context& ioctx() noexcept { return m_strand.context(); }
 	auto target(bool remote) noexcept;
 	void stop();
 
@@ -176,14 +191,19 @@ private:
 	void add_seqnums(seqnum_t seqnum, seqnum_t unlink_seqnum);
 	void restore_server_resp_in(buffer_ptr resp);
 
-	void async_read_header(buffer_ptr buf, bool remote);
+	buffer_ptr get_buffer();
+
+	void async_read_header(bool remote);
 	void on_read_header(const boost::system::error_code &ec, std::size_t transferred, buffer_ptr buf, bool remote);
 
 	void async_read_body(buffer_ptr buf, bool remote);
 	void on_read_body(const boost::system::error_code &ec, std::size_t transferred, buffer_ptr buf, bool remote);
 
-	void async_write_pdu(buffer_ptr buf, bool remote);
-	void on_write_pdu(const boost::system::error_code &ec, std::size_t transferred, buffer_ptr buf, bool remote);
+	void push_write_queue(buffer_ptr &&buf, bool remote);
+	void do_push_write_queue(buffer_ptr &&buf, bool remote);
+
+	void async_write_pdu(bool remote);
+	void on_write_pdu(const boost::system::error_code &ec, std::size_t transferred, bool remote);
 };
 
 
@@ -202,6 +222,10 @@ Forwarder::~Forwarder()
 
 	if (auto n = m_client_req_in.size()) {
 		Trace(TRACE_LEVEL_WARNING, "Seqnums remaining: %Iu", n);
+	}
+
+	if (auto n = m_free_buffers.consume_all( [](auto&){} )) {
+		Trace(TRACE_LEVEL_INFORMATION, "Buffers count %Iu", n);
 	}
 
 	Trace(TRACE_LEVEL_INFORMATION, "Leave");
@@ -266,6 +290,19 @@ auto Forwarder::target(bool remote) noexcept
 	} else {
 		return remote ? "client" : "stub";
 	}
+}
+
+auto Forwarder::get_buffer() -> buffer_ptr
+{
+	buffer_ptr buf;
+
+	if (m_free_buffers.pop(buf)) {
+		buf->resize(sizeof(usbip_header));
+	} else {
+		buf = std::make_shared<buffer_t>(sizeof(usbip_header));
+	}
+
+	return buf;
 }
 
 auto get_client_req_seqnums(const usbip_header &req) noexcept
@@ -385,7 +422,7 @@ void Forwarder::async_start()
 {
 	if (!m_client) {
 		for (auto remote: {false, true}) {
-			async_read_header(std::make_shared<buffer_t>(), remote);
+			async_read_header(remote);
 		}
 		return;
 	}
@@ -393,7 +430,7 @@ void Forwarder::async_start()
 	const std::chrono::seconds vhci_read_timeout(10); // can't gracefully terminate the process during this period
 	size_t transferred = 0;
 
-	auto buf = std::make_shared<buffer_t>(sizeof(usbip_header));
+	auto buf = get_buffer();
 	auto fut = async_read(m_dev, boost::asio::buffer(*buf), boost::asio::use_future);
 
 	switch (fut.wait_for(vhci_read_timeout)) {
@@ -405,7 +442,7 @@ void Forwarder::async_start()
 			break;
 		}
 		on_read_header(boost::system::error_code(), transferred, std::move(buf), false);
-		async_read_header(std::make_shared<buffer_t>(), true);
+		async_read_header(true);
 		break;
 	case std::future_status::timeout:
 		Trace(TRACE_LEVEL_ERROR, "%s -> read timeout %d sec.", target(false), vhci_read_timeout.count());
@@ -416,18 +453,18 @@ void Forwarder::async_start()
 	}
 }
 
-void Forwarder::async_read_header(buffer_ptr buf, bool remote)
+void Forwarder::async_read_header(bool remote)
 {
 	if (stopped()) {
 		return;
 	}
 
+	auto buf = get_buffer();
+
 	auto f = [self = shared_from_this(), buf, remote] (auto&&... args)
 	{
 		self->on_read_header(std::forward<decltype(args)>(args)..., std::move(buf), remote);
 	};
-
-	buf->resize(sizeof(usbip_header));
 
 	remote ? async_read(m_sock, boost::asio::buffer(*buf), std::move(f)) :
 		 async_read(m_dev,  boost::asio::buffer(*buf), std::move(f));
@@ -480,7 +517,8 @@ void Forwarder::async_read_body(buffer_ptr buf, bool remote)
 
 	auto payload = get_payload_size(hdr);
 	if (!payload) {
-		async_write_pdu(std::move(buf), !remote);
+		push_write_queue(std::move(buf), !remote);
+		async_read_header(remote);
 		return;
 	}
 
@@ -511,15 +549,43 @@ void Forwarder::on_read_body(
 	assert(transferred == buf->size() - sizeof(hdr));
 
 	byteswap_payload(hdr);
-	async_write_pdu(std::move(buf), !remote);
+
+	push_write_queue(std::move(buf), !remote);
+	async_read_header(remote);
 }
 
-void Forwarder::async_write_pdu(buffer_ptr buf, bool remote)
+void Forwarder::push_write_queue(buffer_ptr &&buf, bool remote)
+{
+	auto f = [self = shared_from_this(), buf = std::move(buf), remote] () mutable
+	{
+		self->do_push_write_queue(std::move(buf), remote);
+	};
+
+	post(bind_executor(m_write_queue_strand[remote], std::move(f)));
+}
+
+void Forwarder::do_push_write_queue(buffer_ptr &&buf, bool remote)
+{
+	auto &queue = m_write_queue[remote];
+
+	bool was_empty = queue.empty();
+	queue.push(std::move(buf));
+
+	if (was_empty) {
+		async_write_pdu(remote);
+	}
+}
+
+void Forwarder::async_write_pdu(bool remote)
 {
 	if (stopped()) {
 		return;
 	}
 
+	auto &queue = m_write_queue[remote];
+	assert(!queue.empty());
+
+	auto &buf = queue.front();
 	auto &hdr = get_hdr(buf);
 
 	{
@@ -531,23 +597,34 @@ void Forwarder::async_write_pdu(buffer_ptr buf, bool remote)
 		byteswap_header(hdr, swap_dir::host2net);
 	}
 
-	auto f = [self = shared_from_this(), buf, remote] (auto&&... args)
+	auto f = [self = shared_from_this(), remote] (auto&&... args)
 	{
-		self->on_write_pdu(std::forward<decltype(args)>(args)..., buf, remote);
+		self->on_write_pdu(std::forward<decltype(args)>(args)..., remote);
 	};
 
-	remote ? async_write(m_sock, boost::asio::buffer(*buf), std::move(f)) :
-		 async_write(m_dev,  boost::asio::buffer(*buf), transfer_max(), std::move(f));
+	auto ff = bind_executor(m_write_queue_strand[remote], std::move(f));
+
+	remote ? async_write(m_sock, boost::asio::buffer(*buf), std::move(ff)) :
+		 async_write(m_dev,  boost::asio::buffer(*buf), transfer_max(), std::move(ff));
 }
 
-void Forwarder::on_write_pdu(const boost::system::error_code &ec, [[maybe_unused]] std::size_t transferred, buffer_ptr buf, bool remote)
+void Forwarder::on_write_pdu(const boost::system::error_code &ec, [[maybe_unused]] std::size_t transferred, bool remote)
 {
+	auto &queue = m_write_queue[remote];
+
+	{
+		auto &buf = queue.front();
+		assert(ec || transferred == buf->size());
+
+		m_free_buffers.push(std::move(buf));
+		queue.pop();
+	}
+
 	if (ec) {
 		Trace(TRACE_LEVEL_ERROR, "%s <- error #%d '%s'", target(remote), ec.value(), ec.message().c_str());
 		stop();
-	} else {
-		assert(transferred == buf->size());
-		async_read_header(std::move(buf), !remote);
+	} else if (!queue.empty()) {
+		async_write_pdu(remote);
 	}
 }
 
